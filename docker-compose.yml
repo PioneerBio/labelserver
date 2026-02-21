@@ -1,0 +1,24 @@
+services:
+  labelserver:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8889:8889"
+    environment:
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
+      - AZURE_CONTAINER_NAME=${AZURE_CONTAINER_NAME:-media}
+      - API_KEY=${API_KEY:-}
+      - CACHE_DIR=/data/label-cache
+      - CACHE_MAX_SIZE_GB=50
+      - MAX_INDEXED_JOBS=50
+      - MAX_INDEX_MEMORY_MB=8192
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./label-cache:/data/label-cache
+    networks:
+      - default
+      - gateway
+
+networks:
+  gateway:
+    external: true
