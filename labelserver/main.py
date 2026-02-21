@@ -56,12 +56,10 @@ async def health():
 async def get_labels(blob_path: str, bbox: str | None = None):
     """Return labels within a bounding box.
 
+    blob_path: full Azure Blob path (used as cache key directly)
     bbox format: minX,minY,maxX,maxY (image pixel coordinates)
     If bbox is omitted, returns metadata/stats only (not all labels).
     """
-    job_id = blob_path.split('/')[-2] if '/' in blob_path else 'unknown'
-    layer = blob_path.split('_')[-1].split('.')[0] if '_' in blob_path else 'base'
-    
     # Ensure blob is cached locally
     try:
         local_path = await label_blob_cache.get(blob_path)
@@ -69,10 +67,10 @@ async def get_labels(blob_path: str, bbox: str | None = None):
         logger.error(f"Blob not found: {blob_path}: {e}")
         raise HTTPException(404, f"Annotation file not found: {blob_path}")
 
-    # Ensure spatial index is built
+    # Ensure spatial index is built (use blob_path as cache key directly)
     try:
         label_index = await asyncio.to_thread(
-            spatial_manager.get_or_build, job_id, layer, local_path
+            spatial_manager.get_or_build, blob_path, local_path
         )
     except Exception as e:
         logger.error(f"Index build failed: {e}")
@@ -81,8 +79,7 @@ async def get_labels(blob_path: str, bbox: str | None = None):
     if bbox is None:
         # Stats-only response (no labels payload)
         return {
-            "job_id": job_id,
-            "layer": layer,
+            "blob_path": blob_path,
             "total_labels": label_index.label_count,
             "memory_mb": round(label_index.memory_estimate_mb, 1),
         }
@@ -96,7 +93,7 @@ async def get_labels(blob_path: str, bbox: str | None = None):
         raise HTTPException(400, "bbox must be minX,minY,maxX,maxY")
 
     labels = await asyncio.to_thread(
-        spatial_manager.query_bbox, job_id, layer, bbox_tuple
+        spatial_manager.query_bbox, blob_path, bbox_tuple
     )
 
     return Response(
@@ -109,9 +106,6 @@ async def get_labels(blob_path: str, bbox: str | None = None):
 @app.get("/labels/stats")
 async def label_stats(blob_path: str):
     """Quick stats without building full index."""
-    job_id = blob_path.split('/')[-2] if '/' in blob_path else 'unknown'
-    layer = blob_path.split('_')[-1].split('.')[0] if '_' in blob_path else 'base'
-    
     try:
         local_path = await label_blob_cache.get(blob_path)
     except Exception:
@@ -119,23 +113,18 @@ async def label_stats(blob_path: str):
 
     size = os.path.getsize(local_path)
     return {
-        "job_id": job_id,
-        "layer": layer,
+        "blob_path": blob_path,
         "compressed_size_mb": round(size / (1024 * 1024), 1),
-        "is_indexed": spatial_manager._cache_key(job_id, layer) in spatial_manager._indexes,
+        "is_indexed": blob_path in spatial_manager._indexes,
     }
 
 
 @app.post("/labels/invalidate")
 async def invalidate_cache(blob_path: str):
     """Called by azure-studio after a save to bust the cache."""
-    job_id = blob_path.split('/')[-2] if '/' in blob_path else 'unknown'
-    layer = blob_path.split('_')[-1].split('.')[0] if '_' in blob_path else 'base'
-    
-    key = spatial_manager._cache_key(job_id, layer)
-    if key in spatial_manager._indexes:
-        del spatial_manager._indexes[key]
-        
+    if blob_path in spatial_manager._indexes:
+        del spatial_manager._indexes[blob_path]
+
     # Also remove the cached blob so next request re-downloads
     label_blob_cache.remove(blob_path)
     return {"invalidated": True}

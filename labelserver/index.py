@@ -1,6 +1,8 @@
 import gzip
 import json
 import logging
+import os
+import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -10,9 +12,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LabelIndex:
-    """In-memory spatial index for one job+layer's annotations."""
-    job_id: str
-    layer: str
+    """In-memory spatial index for one annotation file."""
+    blob_path: str
     labels: list[dict]                         # raw label dicts
     rtree: rtree_index.Index = field(repr=False)
     label_count: int = 0
@@ -20,38 +21,38 @@ class LabelIndex:
     last_accessed: float = 0.0
 
 class SpatialIndexManager:
-    """LRU cache of per-job spatial indexes built from .json.gz files."""
+    """LRU cache of per-blob spatial indexes built from .json.gz files."""
 
     def __init__(self, max_indexes: int = 50, max_memory_mb: float = 8192):
         self.max_indexes = max_indexes
         self.max_memory_mb = max_memory_mb
         self._indexes: OrderedDict[str, LabelIndex] = OrderedDict()
 
-    def _cache_key(self, job_id: str, layer: str) -> str:
-        return f"{job_id}:{layer or 'base'}"
-
-    def get_or_build(self, job_id: str, layer: str, gz_path: str) -> LabelIndex:
-        """Get existing index or build from .json.gz file."""
-        key = self._cache_key(job_id, layer)
-
-        if key in self._indexes:
-            self._indexes.move_to_end(key)
-            self._indexes[key].last_accessed = time.time()
-            return self._indexes[key]
+    def get_or_build(self, blob_path: str, local_path: str) -> LabelIndex:
+        """Get existing index or build from local file."""
+        if blob_path in self._indexes:
+            self._indexes.move_to_end(blob_path)
+            self._indexes[blob_path].last_accessed = time.time()
+            return self._indexes[blob_path]
 
         # Build new index
-        label_index = self._build_index(job_id, layer, gz_path)
-        self._indexes[key] = label_index
-        self._indexes.move_to_end(key)
+        label_index = self._build_index(blob_path, local_path)
+        self._indexes[blob_path] = label_index
+        self._indexes.move_to_end(blob_path)
         self._evict_if_needed()
         return label_index
 
-    def _build_index(self, job_id: str, layer: str, gz_path: str) -> LabelIndex:
-        """Stream-parse .json.gz and build R-tree index."""
-        logger.info(f"Building spatial index: {job_id}/{layer}")
+    def _build_index(self, blob_path: str, local_path: str) -> LabelIndex:
+        """Parse annotation file and build R-tree index."""
+        logger.info(f"Building spatial index: {blob_path}")
 
-        with gzip.open(gz_path, 'rt', encoding='utf-8') as f:
-            data = json.load(f)
+        # Handle both .json.gz and plain .json files
+        if local_path.endswith('.gz'):
+            with gzip.open(local_path, 'rt', encoding='utf-8') as f:
+                data = json.load(f)
+        else:
+            with open(local_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
 
         labels = data.get('labels', data) if isinstance(data, dict) else data
         idx = rtree_index.Index()
@@ -61,12 +62,17 @@ class SpatialIndexManager:
             if bbox:
                 idx.insert(i, bbox)
 
-        mem_mb = len(json.dumps(labels)) / (1024 * 1024)  # rough estimate
-        logger.info(f"Indexed {len(labels)} labels, ~{mem_mb:.0f} MB")
+        # Estimate memory from file size on disk (avoids re-serializing all labels)
+        file_size = os.path.getsize(local_path)
+        # Gzipped files are ~5-10x smaller than in-memory; plain JSON ~2x (overhead of Python dicts)
+        if local_path.endswith('.gz'):
+            mem_mb = (file_size * 8) / (1024 * 1024)
+        else:
+            mem_mb = (file_size * 2) / (1024 * 1024)
+        logger.info(f"Indexed {len(labels)} labels, ~{mem_mb:.0f} MB (estimated)")
 
         return LabelIndex(
-            job_id=job_id,
-            layer=layer,
+            blob_path=blob_path,
             labels=labels,
             rtree=idx,
             label_count=len(labels),
@@ -102,14 +108,13 @@ class SpatialIndexManager:
 
         return None
 
-    def query_bbox(self, job_id: str, layer: str, bbox: tuple) -> list[dict]:
+    def query_bbox(self, blob_path: str, bbox: tuple) -> list[dict]:
         """Return labels intersecting the given bounding box."""
-        key = self._cache_key(job_id, layer)
-        li = self._indexes.get(key)
+        li = self._indexes.get(blob_path)
         if not li:
             return []
 
-        self._indexes.move_to_end(key)
+        self._indexes.move_to_end(blob_path)
         li.last_accessed = time.time()
 
         indices = list(li.rtree.intersection(bbox))

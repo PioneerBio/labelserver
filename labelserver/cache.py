@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import shutil
 from collections import OrderedDict
 
 from azure.storage.blob import BlobServiceClient
