@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import jwt as pyjwt
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -20,23 +21,58 @@ spatial_manager = SpatialIndexManager(
 
 # --- Middleware ---
 
-class APIKeyMiddleware(BaseHTTPMiddleware):
+class AuthMiddleware(BaseHTTPMiddleware):
+    """Dual auth: JWT (browser clients) + static API key (server-to-server).
+
+    If neither jwt_secret nor api_key is configured, all requests pass (dev mode).
+    """
     OPEN_PATHS = {"/health", "/docs", "/openapi.json"}
-    
+
     async def dispatch(self, request: Request, call_next):
-        if not settings.api_key:
+        # Dev mode: no auth configured
+        if not settings.jwt_secret and not settings.api_key:
             return await call_next(request)
+
+        # Open paths always pass
         if request.url.path in self.OPEN_PATHS:
             return await call_next(request)
+
         auth = request.headers.get("authorization", "")
-        if auth == f"Bearer {settings.api_key}":
+
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+
+            # 1. Static API key check (cheap string compare — server-to-server)
+            if settings.api_key and token == settings.api_key:
+                return await call_next(request)
+
+            # 2. JWT validation (browser clients)
+            if settings.jwt_secret:
+                try:
+                    payload = pyjwt.decode(
+                        token,
+                        settings.jwt_secret,
+                        algorithms=["HS256"],
+                        options={"require": ["exp", "sub", "iss"]},
+                    )
+                    if payload.get("iss") != "azure-studio":
+                        return Response(status_code=401, content="Invalid token issuer")
+                    request.state.user_id = payload.get("sub")
+                    request.state.user_email = payload.get("email", "")
+                    return await call_next(request)
+                except pyjwt.ExpiredSignatureError:
+                    return Response(status_code=401, content="Token expired")
+                except pyjwt.InvalidTokenError:
+                    pass  # Fall through
+
+        # 3. Query param fallback (API key only)
+        token_param = request.query_params.get("token", "")
+        if settings.api_key and token_param == settings.api_key:
             return await call_next(request)
-        token = request.query_params.get("token", "")
-        if token == settings.api_key:
-            return await call_next(request)
+
         return Response(status_code=401, content="Unauthorized")
 
-app.add_middleware(APIKeyMiddleware)
+app.add_middleware(AuthMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
 
 
