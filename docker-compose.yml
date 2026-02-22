@@ -4,6 +4,12 @@ services:
     restart: unless-stopped
     ports:
       - "8889:8889"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8889/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     environment:
       - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
       - AZURE_CONTAINER_NAME=${AZURE_CONTAINER_NAME:-media}
