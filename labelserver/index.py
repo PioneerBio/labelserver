@@ -2,7 +2,6 @@ import gzip
 import json
 import logging
 import os
-import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -15,6 +14,7 @@ class LabelIndex:
     """In-memory spatial index for one annotation file."""
     blob_path: str
     labels: list[dict]                         # raw label dicts
+    centroids: list[tuple[float, float]]       # pre-computed (cx, cy) per label
     rtree: rtree_index.Index = field(repr=False)
     label_count: int = 0
     memory_estimate_mb: float = 0.0
@@ -43,7 +43,7 @@ class SpatialIndexManager:
         return label_index
 
     def _build_index(self, blob_path: str, local_path: str) -> LabelIndex:
-        """Parse annotation file and build R-tree index."""
+        """Parse annotation file and build R-tree index with pre-computed centroids."""
         logger.info(f"Building spatial index: {blob_path}")
 
         # Handle both .json.gz and plain .json files
@@ -56,15 +56,18 @@ class SpatialIndexManager:
 
         labels = data.get('labels', data) if isinstance(data, dict) else data
         idx = rtree_index.Index()
+        centroids: list[tuple[float, float]] = []
 
         for i, label in enumerate(labels):
             bbox = self._compute_bbox(label)
             if bbox:
                 idx.insert(i, bbox)
+                centroids.append(((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2))
+            else:
+                centroids.append((0.0, 0.0))
 
-        # Estimate memory from file size on disk (avoids re-serializing all labels)
+        # Estimate memory from file size on disk
         file_size = os.path.getsize(local_path)
-        # Gzipped files are ~5-10x smaller than in-memory; plain JSON ~2x (overhead of Python dicts)
         if local_path.endswith('.gz'):
             mem_mb = (file_size * 8) / (1024 * 1024)
         else:
@@ -74,6 +77,7 @@ class SpatialIndexManager:
         return LabelIndex(
             blob_path=blob_path,
             labels=labels,
+            centroids=centroids,
             rtree=idx,
             label_count=len(labels),
             memory_estimate_mb=mem_mb,
@@ -119,6 +123,39 @@ class SpatialIndexManager:
 
         indices = list(li.rtree.intersection(bbox))
         return [li.labels[i] for i in indices]
+
+    def query_bbox_lod(self, blob_path: str, bbox: tuple, max_labels: int) -> list[dict]:
+        """Return labels intersecting bbox, simplified to centroids if over max_labels."""
+        li = self._indexes.get(blob_path)
+        if not li:
+            return []
+
+        self._indexes.move_to_end(blob_path)
+        li.last_accessed = time.time()
+
+        indices = list(li.rtree.intersection(bbox))
+
+        if len(indices) <= max_labels:
+            return [li.labels[i] for i in indices]
+
+        # Over budget: subsample evenly and return centroid-only representations
+        step = max(1, len(indices) // max_labels)
+        sampled = indices[::step][:max_labels]
+
+        result = []
+        for i in sampled:
+            label = li.labels[i]
+            cx, cy = li.centroids[i]
+            simplified = {
+                "_id": label.get("_id", str(i)),
+                "label_class": label.get("label_class", ""),
+                "label_type": label.get("label_type", "cell"),
+                "source": label.get("source", ""),
+                "position": {"x": cx, "y": cy},
+                "_simplified": True,
+            }
+            result.append(simplified)
+        return result
 
     def _evict_if_needed(self):
         total_mb = sum(li.memory_estimate_mb for li in self._indexes.values())

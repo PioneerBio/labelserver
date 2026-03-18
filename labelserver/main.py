@@ -89,11 +89,12 @@ async def health():
 
 
 @app.get("/labels")
-async def get_labels(blob_path: str, bbox: str | None = None):
+async def get_labels(blob_path: str, bbox: str | None = None, max_labels: int | None = None):
     """Return labels within a bounding box.
 
     blob_path: full Azure Blob path (used as cache key directly)
     bbox format: minX,minY,maxX,maxY (image pixel coordinates)
+    max_labels: if set, returns simplified centroids when result exceeds this count (LOD)
     If bbox is omitted, returns metadata/stats only (not all labels).
     """
     # Ensure blob is cached locally
@@ -128,9 +129,14 @@ async def get_labels(blob_path: str, bbox: str | None = None):
     except (ValueError, AssertionError):
         raise HTTPException(400, "bbox must be minX,minY,maxX,maxY")
 
-    labels = await asyncio.to_thread(
-        spatial_manager.query_bbox, blob_path, bbox_tuple
-    )
+    if max_labels and max_labels > 0:
+        labels = await asyncio.to_thread(
+            spatial_manager.query_bbox_lod, blob_path, bbox_tuple, max_labels
+        )
+    else:
+        labels = await asyncio.to_thread(
+            spatial_manager.query_bbox, blob_path, bbox_tuple
+        )
 
     return Response(
         content=json.dumps(labels, separators=(',', ':')),
