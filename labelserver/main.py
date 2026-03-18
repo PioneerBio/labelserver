@@ -27,6 +27,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     If neither jwt_secret nor api_key is configured, all requests pass (dev mode).
     """
     OPEN_PATHS = {"/health", "/docs", "/openapi.json"}
+    OPEN_PREFIXES = ("/labels/tiles/",)  # tile images loaded by OSD <img> tags (no auth header)
 
     async def dispatch(self, request: Request, call_next):
         # Dev mode: no auth configured
@@ -35,6 +36,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         # Open paths always pass
         if request.url.path in self.OPEN_PATHS:
+            return await call_next(request)
+        if any(request.url.path.startswith(p) for p in self.OPEN_PREFIXES):
             return await call_next(request)
 
         auth = request.headers.get("authorization", "")
