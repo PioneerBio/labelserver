@@ -1,11 +1,17 @@
 import gzip
+import hashlib
+import io
 import json
 import logging
+import math
 import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from functools import lru_cache
 from rtree import index as rtree_index
+
+from PIL import Image, ImageDraw
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +23,8 @@ class LabelIndex:
     centroids: list[tuple[float, float]]       # pre-computed (cx, cy) per label
     rtree: rtree_index.Index = field(repr=False)
     label_count: int = 0
+    image_width: int = 0                       # bounding box of all labels
+    image_height: int = 0
     memory_estimate_mb: float = 0.0
     last_accessed: float = 0.0
 
@@ -57,12 +65,15 @@ class SpatialIndexManager:
         labels = data.get('labels', data) if isinstance(data, dict) else data
         idx = rtree_index.Index()
         centroids: list[tuple[float, float]] = []
+        max_x, max_y = 0.0, 0.0
 
         for i, label in enumerate(labels):
             bbox = self._compute_bbox(label)
             if bbox:
                 idx.insert(i, bbox)
                 centroids.append(((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2))
+                max_x = max(max_x, bbox[2])
+                max_y = max(max_y, bbox[3])
             else:
                 centroids.append((0.0, 0.0))
 
@@ -80,6 +91,8 @@ class SpatialIndexManager:
             centroids=centroids,
             rtree=idx,
             label_count=len(labels),
+            image_width=int(math.ceil(max_x)),
+            image_height=int(math.ceil(max_y)),
             memory_estimate_mb=mem_mb,
             last_accessed=time.time()
         )
@@ -156,6 +169,90 @@ class SpatialIndexManager:
             }
             result.append(simplified)
         return result
+
+    # ── Tile rendering ──────────────────────────────────────────────────────
+
+    TILE_SIZE = 512
+    FILL_COLOR = (0, 120, 255, 80)    # semi-transparent blue fill
+    STROKE_COLOR = (0, 120, 255, 200) # solid blue stroke
+    POINT_RADIUS = 3
+
+    def get_tile_info(self, blob_path: str) -> dict | None:
+        """Return DZI-like metadata for building the tile pyramid."""
+        li = self._indexes.get(blob_path)
+        if not li:
+            return None
+        w, h = li.image_width, li.image_height
+        if w == 0 or h == 0:
+            return None
+        max_dim = max(w, h)
+        max_level = max(0, int(math.ceil(math.log2(max_dim / self.TILE_SIZE))))
+        return {
+            "width": w,
+            "height": h,
+            "tile_size": self.TILE_SIZE,
+            "max_level": max_level,
+            "total_labels": li.label_count,
+        }
+
+    def render_tile(self, blob_path: str, level: int, col: int, row: int) -> bytes | None:
+        """JIT-render a label tile as RGBA PNG."""
+        li = self._indexes.get(blob_path)
+        if not li:
+            return None
+
+        self._indexes.move_to_end(blob_path)
+        li.last_accessed = time.time()
+
+        ts = self.TILE_SIZE
+        max_dim = max(li.image_width, li.image_height)
+        max_level = max(0, int(math.ceil(math.log2(max_dim / ts))))
+
+        # Scale factor: at max_level each tile = TILE_SIZE pixels of the image
+        # At level 0, one tile covers the entire image
+        scale = ts * (2 ** (max_level - level)) # image pixels per tile
+        bbox = (col * scale, row * scale, (col + 1) * scale, (row + 1) * scale)
+
+        # Query R-tree
+        indices = list(li.rtree.intersection(bbox))
+        if not indices:
+            return None  # empty tile, caller returns 204
+
+        # Coordinate transform: image coords -> tile pixel coords
+        ox, oy = bbox[0], bbox[1]
+        px_per_unit = ts / scale  # tile pixels per image pixel
+
+        img = Image.new('RGBA', (ts, ts), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+
+        for i in indices:
+            label = li.labels[i]
+            regions = label.get('regions')
+            if regions:
+                for ring in regions:
+                    if len(ring) < 3:
+                        continue
+                    poly = [(int((pt['x'] - ox) * px_per_unit),
+                             int((pt['y'] - oy) * px_per_unit)) for pt in ring]
+                    draw.polygon(poly, fill=self.FILL_COLOR, outline=self.STROKE_COLOR)
+            else:
+                # Point or centroid
+                cx, cy = li.centroids[i]
+                px = int((cx - ox) * px_per_unit)
+                py = int((cy - oy) * px_per_unit)
+                r = self.POINT_RADIUS
+                draw.ellipse([px - r, py - r, px + r, py + r],
+                             fill=self.FILL_COLOR, outline=self.STROKE_COLOR)
+
+        buf = io.BytesIO()
+        img.save(buf, format='PNG', optimize=False)
+        return buf.getvalue()
+
+    def tile_etag(self, blob_path: str, level: int, col: int, row: int) -> str:
+        """Compute a stable ETag for cache validation."""
+        li = self._indexes.get(blob_path)
+        key = f"{blob_path}:{li.label_count if li else 0}:{level}:{col}:{row}"
+        return hashlib.md5(key.encode()).hexdigest()[:16]
 
     def _evict_if_needed(self):
         total_mb = sum(li.memory_estimate_mb for li in self._indexes.values())

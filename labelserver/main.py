@@ -161,6 +161,68 @@ async def label_stats(blob_path: str):
     }
 
 
+@app.get("/labels/tiles/info")
+async def tile_info(blob_path: str):
+    """Return DZI-like metadata for the label tile pyramid."""
+    try:
+        local_path = await label_blob_cache.get(blob_path)
+    except Exception as e:
+        raise HTTPException(404, f"Annotation file not found: {blob_path}")
+
+    try:
+        label_index = await asyncio.to_thread(
+            spatial_manager.get_or_build, blob_path, local_path
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Failed to index: {e}")
+
+    info = spatial_manager.get_tile_info(blob_path)
+    if not info:
+        raise HTTPException(404, "No tile info available")
+    return info
+
+
+@app.get("/labels/tiles/{level}/{col}_{row}.png")
+async def get_tile(blob_path: str, level: int, col: int, row: int, request: Request):
+    """JIT-render a label tile as RGBA PNG."""
+    # ETag support
+    etag = spatial_manager.tile_etag(blob_path, level, col, row)
+    if_none_match = request.headers.get("if-none-match", "")
+    if if_none_match == etag:
+        return Response(status_code=304)
+
+    # Ensure index is built
+    try:
+        local_path = await label_blob_cache.get(blob_path)
+    except Exception:
+        raise HTTPException(404, "Annotation file not found")
+
+    try:
+        await asyncio.to_thread(
+            spatial_manager.get_or_build, blob_path, local_path
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Failed to index: {e}")
+
+    # Render tile
+    png_bytes = await asyncio.to_thread(
+        spatial_manager.render_tile, blob_path, level, col, row
+    )
+
+    if png_bytes is None:
+        # Empty tile — transparent
+        return Response(status_code=204)
+
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={
+            "ETag": etag,
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
+
+
 @app.post("/labels/invalidate")
 async def invalidate_cache(blob_path: str):
     """Called by azure-studio after a save to bust the cache."""
