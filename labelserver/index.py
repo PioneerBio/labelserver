@@ -35,6 +35,13 @@ class SpatialIndexManager:
         self.max_indexes = max_indexes
         self.max_memory_mb = max_memory_mb
         self._indexes: OrderedDict[str, LabelIndex] = OrderedDict()
+        self._index_status: dict[str, dict] = {}  # blob_path -> {"status", "progress", "error"}
+
+    def get_index_status(self, blob_path: str) -> dict | None:
+        """Get current indexing status without triggering a build."""
+        if blob_path in self._indexes:
+            return {"status": "ready"}
+        return self._index_status.get(blob_path)
 
     def get_or_build(self, blob_path: str, local_path: str) -> LabelIndex:
         """Get existing index or build from local file."""
@@ -44,9 +51,15 @@ class SpatialIndexManager:
             return self._indexes[blob_path]
 
         # Build new index
-        label_index = self._build_index(blob_path, local_path)
+        self._index_status[blob_path] = {"status": "indexing", "progress": 0.0}
+        try:
+            label_index = self._build_index(blob_path, local_path)
+        except Exception as e:
+            self._index_status[blob_path] = {"status": "error", "error": str(e)}
+            raise
         self._indexes[blob_path] = label_index
         self._indexes.move_to_end(blob_path)
+        self._index_status[blob_path] = {"status": "ready"}
         self._evict_if_needed()
         return label_index
 

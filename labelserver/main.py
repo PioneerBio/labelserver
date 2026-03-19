@@ -164,6 +164,32 @@ async def label_stats(blob_path: str):
     }
 
 
+@app.get("/labels/status")
+async def label_status(blob_path: str):
+    """Lightweight status check — no downloads or indexing triggered.
+
+    Returns the current state of blob download and spatial index
+    so the frontend can show progress indicators.
+    """
+    cache_status = label_blob_cache.get_status(blob_path)
+    is_indexed = blob_path in spatial_manager._indexes
+    index_status = spatial_manager.get_index_status(blob_path)
+
+    result = {
+        "blob_path": blob_path,
+        **cache_status.to_dict(),
+        "indexed": is_indexed,
+    }
+    if index_status:
+        result["index"] = index_status
+    if is_indexed:
+        li = spatial_manager._indexes.get(blob_path)
+        if li:
+            result["total_labels"] = li.label_count
+            result["memory_mb"] = round(li.memory_estimate_mb, 1)
+    return result
+
+
 @app.get("/labels/tiles/info")
 async def tile_info(blob_path: str):
     """Return DZI-like metadata for the label tile pyramid."""
