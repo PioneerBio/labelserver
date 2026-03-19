@@ -76,6 +76,11 @@ class SpatialIndexManager:
                 data = json.load(f)
 
         labels = data.get('labels', data) if isinstance(data, dict) else data
+
+        # Read image dimensions from metadata (primary) or fall back to label extent
+        meta_width = data.get('image_width') if isinstance(data, dict) else None
+        meta_height = data.get('image_height') if isinstance(data, dict) else None
+
         idx = rtree_index.Index()
         centroids: list[tuple[float, float]] = []
         max_x, max_y = 0.0, 0.0
@@ -90,13 +95,17 @@ class SpatialIndexManager:
             else:
                 centroids.append((0.0, 0.0))
 
+        image_width = int(meta_width) if meta_width else int(math.ceil(max_x))
+        image_height = int(meta_height) if meta_height else int(math.ceil(max_y))
+        dims_source = "metadata" if meta_width and meta_height else "label_extent"
+
         # Estimate memory from file size on disk
         file_size = os.path.getsize(local_path)
         if local_path.endswith('.gz'):
             mem_mb = (file_size * 8) / (1024 * 1024)
         else:
             mem_mb = (file_size * 2) / (1024 * 1024)
-        logger.info(f"Indexed {len(labels)} labels, ~{mem_mb:.0f} MB (estimated)")
+        logger.info(f"Indexed {len(labels)} labels, ~{mem_mb:.0f} MB, dims={image_width}x{image_height} ({dims_source})")
 
         return LabelIndex(
             blob_path=blob_path,
@@ -104,8 +113,8 @@ class SpatialIndexManager:
             centroids=centroids,
             rtree=idx,
             label_count=len(labels),
-            image_width=int(math.ceil(max_x)),
-            image_height=int(math.ceil(max_y)),
+            image_width=image_width,
+            image_height=image_height,
             memory_estimate_mb=mem_mb,
             last_accessed=time.time()
         )
