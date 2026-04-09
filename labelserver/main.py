@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import jwt as pyjwt
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,7 +28,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
     If neither jwt_secret nor api_key is configured, all requests pass (dev mode).
     """
     OPEN_PATHS = {"/health", "/docs", "/openapi.json"}
-    OPEN_PREFIXES = ("/labels/tiles/",)  # tile images loaded by OSD <img> tags (no auth header)
+    OPEN_PREFIXES = ()  # tile auth now handled via ?token= JWT query param
 
     async def dispatch(self, request: Request, call_next):
         # Dev mode: no auth configured
@@ -62,21 +63,75 @@ class AuthMiddleware(BaseHTTPMiddleware):
                         return Response(status_code=401, content="Invalid token issuer")
                     request.state.user_id = payload.get("sub")
                     request.state.user_email = payload.get("email", "")
+                    request.state.projects = payload.get("projects", [])
                     return await call_next(request)
                 except pyjwt.ExpiredSignatureError:
                     return Response(status_code=401, content="Token expired")
                 except pyjwt.InvalidTokenError:
                     pass  # Fall through
 
-        # 3. Query param fallback (API key only)
+        # 3. Query param fallback (?token= for <img> tags that can't send headers)
         token_param = request.query_params.get("token", "")
-        if settings.api_key and token_param == settings.api_key:
-            return await call_next(request)
+        if token_param:
+            if settings.api_key and token_param == settings.api_key:
+                return await call_next(request)
+            if settings.jwt_secret:
+                try:
+                    payload = pyjwt.decode(
+                        token_param,
+                        settings.jwt_secret,
+                        algorithms=["HS256"],
+                        options={"require": ["exp", "sub", "iss"]},
+                    )
+                    if payload.get("iss") == "azure-studio":
+                        request.state.user_id = payload.get("sub")
+                        request.state.user_email = payload.get("email", "")
+                        request.state.projects = payload.get("projects", [])
+                        return await call_next(request)
+                except pyjwt.InvalidTokenError:
+                    pass
 
         return Response(status_code=401, content="Unauthorized")
 
 app.add_middleware(AuthMiddleware)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://app.pioneerbio.se",
+        "https://test.pioneerbio.se",
+        "https://dev.pioneerbio.se",
+        "https://lab.pioneerbio.se",
+        "https://lab-test.pioneerbio.se",
+        "http://localhost:4200",
+        "http://localhost:4201",
+    ],
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+
+# --- Project-level access validation ---
+
+BLOB_PATH_PATTERN = re.compile(r"^projects/(?:project-)?([a-f0-9-]+)/")
+
+
+def validate_project_access(request: Request, blob_path: str) -> None:
+    """Raise 403 if user's JWT doesn't grant access to this project.
+
+    API key requests (server-to-server) bypass this check because
+    request.state.projects is not set for them.
+    """
+    if not hasattr(request.state, "projects"):
+        return
+    projects = request.state.projects
+    if "*" in projects:
+        return
+    match = BLOB_PATH_PATTERN.match(blob_path)
+    if not match:
+        raise HTTPException(403, "Cannot determine project from blob path")
+    if match.group(1) not in projects:
+        raise HTTPException(403, "Access denied to this project")
 
 
 # --- Endpoints ---
@@ -92,7 +147,7 @@ async def health():
 
 
 @app.get("/labels")
-async def get_labels(blob_path: str, bbox: str | None = None, max_labels: int | None = None):
+async def get_labels(blob_path: str, request: Request, bbox: str | None = None, max_labels: int | None = None):
     """Return labels within a bounding box.
 
     blob_path: full Azure Blob path (used as cache key directly)
@@ -100,6 +155,8 @@ async def get_labels(blob_path: str, bbox: str | None = None, max_labels: int | 
     max_labels: if set, returns simplified centroids when result exceeds this count (LOD)
     If bbox is omitted, returns metadata/stats only (not all labels).
     """
+    validate_project_access(request, blob_path)
+
     # Ensure blob is cached locally
     try:
         local_path = await label_blob_cache.get(blob_path)
@@ -149,8 +206,9 @@ async def get_labels(blob_path: str, bbox: str | None = None, max_labels: int | 
 
 
 @app.get("/labels/stats")
-async def label_stats(blob_path: str):
+async def label_stats(blob_path: str, request: Request):
     """Quick stats without building full index."""
+    validate_project_access(request, blob_path)
     try:
         local_path = await label_blob_cache.get(blob_path)
     except Exception:
@@ -165,12 +223,13 @@ async def label_stats(blob_path: str):
 
 
 @app.get("/labels/status")
-async def label_status(blob_path: str):
+async def label_status(blob_path: str, request: Request):
     """Lightweight status check — no downloads or indexing triggered.
 
     Returns the current state of blob download and spatial index
     so the frontend can show progress indicators.
     """
+    validate_project_access(request, blob_path)
     cache_status = label_blob_cache.get_status(blob_path)
     is_indexed = blob_path in spatial_manager._indexes
     index_status = spatial_manager.get_index_status(blob_path)
@@ -191,8 +250,9 @@ async def label_status(blob_path: str):
 
 
 @app.get("/labels/tiles/info")
-async def tile_info(blob_path: str):
+async def tile_info(blob_path: str, request: Request):
     """Return DZI-like metadata for the label tile pyramid."""
+    validate_project_access(request, blob_path)
     try:
         local_path = await label_blob_cache.get(blob_path)
     except Exception as e:
@@ -214,6 +274,8 @@ async def tile_info(blob_path: str):
 @app.get("/labels/tiles/{level}/{col}_{row}.png")
 async def get_tile(blob_path: str, level: int, col: int, row: int, request: Request):
     """JIT-render a label tile as RGBA PNG."""
+    validate_project_access(request, blob_path)
+
     # ETag support
     etag = spatial_manager.tile_etag(blob_path, level, col, row)
     if_none_match = request.headers.get("if-none-match", "")
@@ -247,14 +309,15 @@ async def get_tile(blob_path: str, level: int, col: int, row: int, request: Requ
         media_type="image/png",
         headers={
             "ETag": etag,
-            "Cache-Control": "public, max-age=3600",
+            "Cache-Control": "private, max-age=3600",
         },
     )
 
 
 @app.post("/labels/invalidate")
-async def invalidate_cache(blob_path: str):
+async def invalidate_cache(blob_path: str, request: Request):
     """Called by azure-studio after a save to bust the cache."""
+    validate_project_access(request, blob_path)
     if blob_path in spatial_manager._indexes:
         del spatial_manager._indexes[blob_path]
 
